@@ -61,7 +61,7 @@ jobs:
         run: |
           # 只覆盖与新增，不删除；.github、README.md、index.html 保留本仓库版本
           git checkout "${{ steps.upstream.outputs.sha }}" -- . \
-            ':(exclude).github' ':(exclude)README.md' ':(exclude)index.html' ':(exclude)downloads.html'
+            ':(exclude).github' ':(exclude)README.md' ':(exclude)index.html'
           git reset -q HEAD -- .github
           git checkout HEAD -- .github
           git clean -fdq .github
