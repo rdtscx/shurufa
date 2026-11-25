@@ -1,0 +1,129 @@
+name: sync-upstream
+
+# 每天 08:00 / 20:00（北京时间 = UTC+8）同步上游 fcitx5-android/fcitx5-android
+# GitHub 的 cron 用 UTC，所以写 0 0 / 0 12
+on:
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: fcitx5-android/fcitx5-android
+  UPSTREAM_BRANCH: main
+
+jobs:
+  mirror-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "shurufa-backup-bot"
+          git config user.email "shurufa-backup-bot@users.noreply.github.com"
+
+      - name: Keep schedule alive
+        run: |
+          last="$(git log -1 --format=%ct)"
+          if [ $(( $(date +%s) - last )) -gt $(( 40 * 86400 )) ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .sync-heartbeat
+            git add .sync-heartbeat
+            git commit -m "chore: 心跳提交，避免定时任务被停用"
+          fi
+
+      - name: Fetch upstream
+        id: upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          for i in 1 2 3; do
+            if git fetch --no-tags upstream "${UPSTREAM_BRANCH}"; then
+              echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::上游 ${UPSTREAM_REPO} 拉取失败（可能已删除或改名），本次跳过镜像"
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror files add-only
+        if: steps.upstream.outputs.ok == 'true'
+        run: |
+          # 只覆盖与新增，不删除；.github、README.md、index.html 保留本仓库版本
+          git checkout "${{ steps.upstream.outputs.sha }}" -- . \
+            ':(exclude).github' ':(exclude)README.md' ':(exclude)index.html' ':(exclude)downloads.html'
+          git reset -q HEAD -- .github
+          git checkout HEAD -- .github
+          git clean -fdq .github
+          git diff --cached --quiet || git commit -m "sync: ${UPSTREAM_REPO}@$(git rev-parse --short ${{ steps.upstream.outputs.sha }})"
+
+      - name: Push
+        run: git push origin "HEAD:main"
+
+  mirror-releases:
+    needs: mirror-code
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "shurufa-backup-bot"
+          git config user.email "shurufa-backup-bot@users.noreply.github.com"
+
+      - name: Mirror releases and APK assets add-only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          up="${UPSTREAM_REPO}"
+          ours="${GITHUB_REPOSITORY}"
+          tmp="$(mktemp -d)"
+          if ! tags="$(gh api "repos/${up}/releases" --paginate --jq '.[] | select(.draft == false) | .tag_name')"; then
+            echo "::warning::上游 ${up} 的 Release 列表不可用，本次跳过"
+            exit 0
+          fi
+          for tag in ${tags}; do
+            echo "== ${tag}"
+            if ! gh release view "${tag}" --repo "${ours}" > /dev/null 2>&1; then
+              gh release view "${tag}" --repo "${up}" --json body --jq '.body // ""' > "${tmp}/body.md"
+              title="$(gh release view "${tag}" --repo "${up}" --json name --jq '.name // ""')"
+              [ -n "${title}" ] || title="${tag}"
+              gh release create "${tag}" --repo "${ours}" --title "${title}" --notes-file "${tmp}/body.md" --target main
+            fi
+            ours_assets="$(gh release view "${tag}" --repo "${ours}" --json assets --jq '.assets[].name')"
+            up_assets="$(gh release view "${tag}" --repo "${up}" --json assets --jq '.assets[] | select(.name | endswith(".apk")) | .name')"
+            for name in ${up_assets}; do
+              if printf '%s\n' "${ours_assets}" | grep -qxF "${name}"; then
+                continue
+              fi
+              gh release download "${tag}" --repo "${up}" --pattern "${name}" --dir "${tmp}/dl"
+              gh release upload "${tag}" "${tmp}/dl/${name}" --repo "${ours}"
+              rm -f "${tmp}/dl/${name}"
+            done
+          done
+
+      - name: Rebuild downloads page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/build_downloads.py
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "下载区块无变化"
+          else
+            git commit -m "chore: 按最新 Release 重建页尾下载区块"
+            git push origin HEAD:main
+          fi
