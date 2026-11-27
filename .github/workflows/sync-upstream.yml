@@ -15,12 +15,42 @@ concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
-env:
-  UPSTREAM_REPO: fcitx5-android/fcitx5-android
-  UPSTREAM_BRANCH: main
-
 jobs:
+  resolve-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.r.outputs.repo }}
+      branch: ${{ steps.r.outputs.branch }}
+      status: ${{ steps.r.outputs.status }}
+      renamed: ${{ steps.r.outputs.renamed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 跟随上游：解析真实仓库名与默认分支
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/resolve_upstream.py --apply --repo-name "${GITHUB_REPOSITORY#*/}"
+
+      - name: 回写上游关系变更
+        run: |
+          set -euo pipefail
+          git config user.name "upstream-follow-bot"
+          git config user.email "upstream-follow-bot@users.noreply.github.com"
+          git add upstream.json scripts/build_downloads.py
+          if git diff --cached --quiet; then
+            echo "上游关系无变化"
+          else
+            git commit -m "chore: 跟随上游变更 $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push origin HEAD:main
+          fi
+
   mirror-code:
+    needs: resolve-upstream
+    if: needs.resolve-upstream.outputs.status == 'ok'
+    env:
+      UPSTREAM_REPO: ${{ needs.resolve-upstream.outputs.repo }}
+      UPSTREAM_BRANCH: ${{ needs.resolve-upstream.outputs.branch }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,15 +83,15 @@ jobs:
             fi
             sleep 15
           done
-          echo "::warning::上游 ${UPSTREAM_REPO} 拉取失败（可能已删除或改名），本次跳过镜像"
-          echo "ok=false" >> "$GITHUB_OUTPUT"
+          echo "::error::上游 ${UPSTREAM_REPO} 已解析但代码拉取失败，请检查分支或网络"
+          exit 1
 
       - name: Mirror files add-only
         if: steps.upstream.outputs.ok == 'true'
         run: |
           # 只覆盖与新增，不删除；.github、README.md、index.html 保留本仓库版本
           git checkout "${{ steps.upstream.outputs.sha }}" -- . \
-            ':(exclude).github' ':(exclude)README.md' ':(exclude)index.html'
+            ':(exclude).github' ':(exclude)README.md' ':(exclude)index.html' ':(exclude)scripts' ':(exclude)upstream.json'
           git reset -q HEAD -- .github
           git checkout HEAD -- .github
           git clean -fdq .github
@@ -71,8 +101,11 @@ jobs:
         run: git push origin "HEAD:main"
 
   mirror-releases:
-    needs: mirror-code
+    needs: [resolve-upstream, mirror-code]
     if: always()
+    env:
+      UPSTREAM_REPO: ${{ needs.resolve-upstream.outputs.repo }}
+      UPSTREAM_BRANCH: ${{ needs.resolve-upstream.outputs.branch }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
